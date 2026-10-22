@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SmartFit — Платформа продуктивности, питания и умных тренировок</title>
+    <meta name="description" content="Интеллектуальная веб-платформа с компьютерным зрением MediaPipe для анализа техники упражнений в реальном времени, расчётом суточной нормы КБЖУ по формуле Миффлина-Сан Жеора, дневником питания и фитнес-программами.">
+    <meta property="og:title" content="SmartFit — Платформа продуктивности, питания и умных тренировок">
+    <meta property="og:description" content="Компьютерное зрение MediaPipe для анализа техники упражнений, калькулятор КБЖУ и программы тренировок.">
+
+    <!-- Шрифты Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+
+    <!-- MediaPipe Pose (Client-side AI Computer Vision) -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+</body>
+</html>
