@@ -2,10 +2,15 @@ import { ExerciseState, Landmark } from '../types';
 import { calculateAngle, landmarkXY } from '../utils/geometry';
 
 export const POSE_CONNECTIONS: [number, number][] = [
-  [11, 12], [11, 13], [13, 15], [12, 14], [14, 16], // Руки и плечи
+  [0, 1], [1, 2], [2, 3], [3, 7],                   // Голова слева
+  [0, 4], [4, 5], [5, 6], [6, 8],                   // Голова справа
+  [9, 10],                                          // Рот
+  [11, 12],                                         // Плечи
+  [11, 13], [13, 15], [15, 17], [15, 19], [15, 21], // Левая рука
+  [12, 14], [14, 16], [16, 18], [16, 20], [16, 22], // Правая рука
   [11, 23], [12, 24], [23, 24],                     // Торс
-  [23, 25], [24, 26], [25, 27], [26, 28],           // Ноги
-  [27, 29], [28, 30], [29, 31], [30, 32]            // Стопы
+  [23, 25], [25, 27], [27, 29], [29, 31], [27, 31], // Левая нога
+  [24, 26], [26, 28], [28, 30], [30, 32], [28, 32]  // Правая нога
 ];
 
 export interface BaseEngine {
@@ -420,19 +425,26 @@ export function drawSkeletonOnCanvas(
   errorFlag: boolean
 ): void {
   ctx.clearRect(0, 0, width, height);
+  if (!landmarks || landmarks.length === 0) return;
 
-  const lineColor = errorFlag ? '#ef4444' : '#00aa55';
-  const jointColor = errorFlag ? '#f87171' : '#4ade80';
+  const lineColor = errorFlag ? '#ef4444' : '#00ff7f';
+  const jointColor = errorFlag ? '#f87171' : '#00e676';
 
-  ctx.lineWidth = 5;
+  ctx.save();
+  ctx.lineWidth = 4;
   ctx.strokeStyle = lineColor;
   ctx.lineCap = 'round';
+  ctx.shadowColor = lineColor;
+  ctx.shadowBlur = 10;
 
   // Draw connecting bones
   POSE_CONNECTIONS.forEach(([i, j]) => {
     const ptA = landmarks[i];
     const ptB = landmarks[j];
-    if (ptA && ptB && (ptA.visibility ?? 1) > 0.4 && (ptB.visibility ?? 1) > 0.4) {
+    const visA = ptA?.visibility !== undefined ? ptA.visibility : 1.0;
+    const visB = ptB?.visibility !== undefined ? ptB.visibility : 1.0;
+
+    if (ptA && ptB && visA > 0.15 && visB > 0.15) {
       ctx.beginPath();
       ctx.moveTo(ptA.x * width, ptA.y * height);
       ctx.lineTo(ptB.x * width, ptB.y * height);
@@ -442,9 +454,10 @@ export function drawSkeletonOnCanvas(
 
   // Draw joint keypoints
   landmarks.forEach(pt => {
-    if (pt && (pt.visibility ?? 1) > 0.4) {
+    const vis = pt?.visibility !== undefined ? pt.visibility : 1.0;
+    if (pt && vis > 0.15) {
       ctx.beginPath();
-      ctx.arc(pt.x * width, pt.y * height, 6, 0, 2 * Math.PI);
+      ctx.arc(pt.x * width, pt.y * height, 5, 0, 2 * Math.PI);
       ctx.fillStyle = jointColor;
       ctx.fill();
       ctx.lineWidth = 2;
@@ -452,4 +465,6 @@ export function drawSkeletonOnCanvas(
       ctx.stroke();
     }
   });
+
+  ctx.restore();
 }

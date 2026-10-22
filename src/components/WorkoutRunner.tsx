@@ -9,6 +9,7 @@ import {
   BaseEngine,
   drawSkeletonOnCanvas
 } from '../vision/exerciseEngines';
+import { PoseService } from '../vision/poseService';
 
 interface Props {
   sessionConfig: WorkoutSessionConfig;
@@ -35,6 +36,7 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
   const [errorFlag, setErrorFlag] = useState(false);
   const [angles, setAngles] = useState<Record<string, number>>({});
   const [cameraError, setCameraError] = useState<string | null>(null);
+  const [modelStatus, setModelStatus] = useState<'loading' | 'ready' | 'idle'>('idle');
 
   // Countdown state before each set
   const [countdownText, setCountdownText] = useState('3');
@@ -53,13 +55,13 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
   const [completedSetsCount, setCompletedSetsCount] = useState(0);
   const [completedRepsCount, setCompletedRepsCount] = useState(0);
 
-  // Camera / Video / Socket refs
+  // Camera / Video / AI refs
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const poseServiceRef = useRef<PoseService | null>(null);
+  const animFrameIdRef = useRef<number | null>(null);
   const socketRef = useRef<Socket | null>(null);
-  const frameIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const engineRef = useRef<BaseEngine>(new SquatEngine());
   const lastErrorRef = useRef(false);
   const lastRepsRef = useRef(0);
@@ -88,53 +90,17 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
     setCameraError(null);
   }, [currentExerciseIndex, currentEx]);
 
-  // Connect socket for Python MediaPipe backend
+  // Connect socket for Python MediaPipe backend (optional enhancement for local PC)
   useEffect(() => {
     const socket = io({
       transports: ['websocket', 'polling'],
-      reconnectionAttempts: 5,
-      timeout: 3000
+      reconnectionAttempts: 3,
+      timeout: 2500
     });
 
     socket.on('connect', () => {
       if (currentEx?.hasAiCamera) {
         socket.emit('select_exercise', { exercise: currentEx.key });
-      }
-    });
-
-    socket.on('pose_feedback', (data: any) => {
-      if (!data) return;
-
-      if (typeof data.reps === 'number') {
-        if (data.reps > lastRepsRef.current) {
-          Sound.playSuccess();
-          setBumpReps(true);
-          setTimeout(() => setBumpReps(false), 250);
-        }
-        lastRepsRef.current = data.reps;
-        setCurrentReps(data.reps);
-      }
-
-      if (data.error_flag && !lastErrorRef.current) {
-        Sound.playError();
-      }
-      lastErrorRef.current = !!data.error_flag;
-
-      if (data.status_text) setStatusText(data.status_text);
-      if (data.status_color) setStatusColor(data.status_color);
-      setErrorFlag(!!data.error_flag);
-      if (data.angles) setAngles(data.angles);
-
-      // Draw skeleton received from Python MediaPipe
-      if (canvasRef.current) {
-        const ctx = canvasRef.current.getContext('2d');
-        if (ctx) {
-          if (data.landmarks && data.landmarks.length > 0) {
-            drawSkeletonOnCanvas(ctx, canvasRef.current.width, canvasRef.current.height, data.landmarks, !!data.error_flag);
-          } else {
-            ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
-          }
-        }
       }
     });
 
@@ -146,12 +112,54 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
     };
   }, []);
 
-  // Sync selected exercise with socket
-  useEffect(() => {
-    if (socketRef.current && socketRef.current.connected && currentEx?.hasAiCamera) {
-      socketRef.current.emit('select_exercise', { exercise: currentEx.key });
+  // Update exercise state from landmarks detected by MediaPipe
+  const handlePoseLandmarks = useCallback((landmarks: Landmark[]) => {
+    if (!canvasRef.current || !videoRef.current) return;
+
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Synchronize canvas size with video feed
+    const vw = videoRef.current.videoWidth || 640;
+    const vh = videoRef.current.videoHeight || 480;
+    if (canvas.width !== vw || canvas.height !== vh) {
+      canvas.width = vw;
+      canvas.height = vh;
     }
-  }, [currentEx]);
+
+    if (landmarks && landmarks.length >= 17) {
+      // Process exercise logic using exact biomechanics engine
+      const state = engineRef.current.process(landmarks);
+
+      // Rep count bump and sound
+      if (state.reps > lastRepsRef.current) {
+        Sound.playSuccess();
+        setBumpReps(true);
+        setTimeout(() => setBumpReps(false), 250);
+      }
+      lastRepsRef.current = state.reps;
+      setCurrentReps(state.reps);
+
+      if (state.errorFlag && !lastErrorRef.current) {
+        Sound.playError();
+      }
+      lastErrorRef.current = !!state.errorFlag;
+
+      setStatusText(state.statusText);
+      setStatusColor(state.statusColor);
+      setErrorFlag(!!state.errorFlag);
+      if (state.angles) setAngles(state.angles);
+
+      // Draw glowing skeleton overlay
+      drawSkeletonOnCanvas(ctx, canvas.width, canvas.height, landmarks, !!state.errorFlag);
+    } else {
+      // No person detected or person out of bounds
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      setStatusText('👉 Встаньте перед камерой так, чтобы тело было видно');
+      setStatusColor('#4a4a4a');
+    }
+  }, []);
 
   // Countdown before starting set
   const runPreSetCountdown = useCallback(async () => {
@@ -178,10 +186,11 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
     setPhase('exercise');
   }, []);
 
-  // Initialize REAL webcam (absolutely NO video fallbacks!)
+  // Initialize REAL webcam and MediaPipe Vision Core
   const startCameraFeed = useCallback(async () => {
     if (!currentEx?.hasAiCamera) return;
     setCameraError(null);
+    setModelStatus('loading');
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -198,28 +207,35 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
           canvasRef.current.width = videoRef.current.videoWidth || 640;
           canvasRef.current.height = videoRef.current.videoHeight || 480;
         }
+      }
 
-        // Hidden canvas for frame capture
-        if (!captureCanvasRef.current) {
-          captureCanvasRef.current = document.createElement('canvas');
-          captureCanvasRef.current.width = 480;
-          captureCanvasRef.current.height = 360;
-        }
+      // Initialize client-side MediaPipe Pose
+      if (!poseServiceRef.current) {
+        poseServiceRef.current = new PoseService({
+          onResults: (landmarks) => {
+            handlePoseLandmarks(landmarks);
+          },
+          onStatusChange: (status) => {
+            if (status === 'ready') setModelStatus('ready');
+            if (status === 'error') setModelStatus('idle');
+          }
+        });
+        await poseServiceRef.current.initialize();
       }
 
       await runPreSetCountdown();
     } catch (err: any) {
       console.warn('Webcam permission error:', err);
-      // Clean error without any video fallback
+      setModelStatus('idle');
       setCameraError('Веб-камера недоступна. Пожалуйста, подключите камеру и разрешите доступ к ней в настройках браузера.');
     }
-  }, [currentEx, runPreSetCountdown]);
+  }, [currentEx, handlePoseLandmarks, runPreSetCountdown]);
 
   // Clean up camera stream and frame sending
   const stopCameraFeed = useCallback(() => {
-    if (frameIntervalRef.current) {
-      clearInterval(frameIntervalRef.current);
-      frameIntervalRef.current = null;
+    if (animFrameIdRef.current) {
+      cancelAnimationFrame(animFrameIdRef.current);
+      animFrameIdRef.current = null;
     }
 
     if (streamRef.current) {
@@ -237,34 +253,31 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
     }
   }, []);
 
-  // Frame capture loop sending webcam frames to Python MediaPipe socket
+  // Frame processing loop with MediaPipe Pose
   useEffect(() => {
     if (phase !== 'exercise' || !currentEx?.hasAiCamera || cameraError) return;
 
-    frameIntervalRef.current = setInterval(() => {
-      if (!videoRef.current || videoRef.current.readyState < 2) return;
+    let isActive = true;
 
-      if (!captureCanvasRef.current) {
-        captureCanvasRef.current = document.createElement('canvas');
-        captureCanvasRef.current.width = 480;
-        captureCanvasRef.current.height = 360;
+    const renderLoop = async () => {
+      if (!isActive) return;
+
+      if (videoRef.current && videoRef.current.readyState >= 2 && poseServiceRef.current) {
+        await poseServiceRef.current.processFrame(videoRef.current);
       }
 
-      const captureCtx = captureCanvasRef.current.getContext('2d');
-      if (!captureCtx) return;
-
-      captureCtx.drawImage(videoRef.current, 0, 0, 480, 360);
-      const dataUrl = captureCanvasRef.current.toDataURL('image/jpeg', 0.6);
-
-      if (socketRef.current && socketRef.current.connected) {
-        socketRef.current.emit('process_frame', { frame: dataUrl });
+      if (isActive) {
+        animFrameIdRef.current = requestAnimationFrame(renderLoop);
       }
-    }, 70); // 14 FPS
+    };
+
+    animFrameIdRef.current = requestAnimationFrame(renderLoop);
 
     return () => {
-      if (frameIntervalRef.current) {
-        clearInterval(frameIntervalRef.current);
-        frameIntervalRef.current = null;
+      isActive = false;
+      if (animFrameIdRef.current) {
+        cancelAnimationFrame(animFrameIdRef.current);
+        animFrameIdRef.current = null;
       }
     };
   }, [phase, currentEx, cameraError]);
@@ -287,6 +300,17 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
       stopCameraFeed();
     };
   }, [currentExerciseIndex, currentSetIndex, currentEx, startCameraFeed, stopCameraFeed, runPreSetCountdown]);
+
+  // Destroy pose service on unmount
+  useEffect(() => {
+    return () => {
+      if (poseServiceRef.current) {
+        poseServiceRef.current.destroy();
+        poseServiceRef.current = null;
+      }
+      stopCameraFeed();
+    };
+  }, [stopCameraFeed]);
 
   // Timer for manual timed exercises (like Plank)
   useEffect(() => {
@@ -601,7 +625,9 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
                   <div className="hud-top">
                     <div className="hud-pill">
                       <span className="live-indicator" />
-                      PYTHON MEDIAPIPE CORE · ПОДХОД {currentSetIndex}/{currentEx.setsCount}
+                      {modelStatus === 'loading'
+                        ? 'ЗАГРУЗКА MEDIAPIPE...'
+                        : `MEDIAPIPE POSE AI · ПОДХОД ${currentSetIndex}/${currentEx.setsCount}`}
                     </div>
                     <div className="rep-display-box">
                       <div className={`rep-number ${bumpReps ? 'bump' : ''}`}>{currentReps}</div>
@@ -633,7 +659,7 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
             <div className="trainer-controls-panel">
               <div className="controls-left">
                 <span style={{ fontSize: '13px', color: '#666' }}>
-                  Python MediaPipe Pose анализирует технику в реальном времени
+                  Нейросеть MediaPipe отслеживает ключевые суставы и оценивает чистоту техники
                 </span>
               </div>
               <div className="controls-right">
