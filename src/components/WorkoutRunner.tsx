@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { io, Socket } from 'socket.io-client';
 import { CompletedWorkoutSession, Landmark, WorkoutSessionConfig, WorkoutSet } from '../types';
 import { Sound } from '../utils/sound';
 import {
@@ -33,6 +34,7 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
   const [statusColor, setStatusColor] = useState('#4a4a4a');
   const [errorFlag, setErrorFlag] = useState(false);
   const [angles, setAngles] = useState<Record<string, number>>({});
+  const [cameraError, setCameraError] = useState<string | null>(null);
 
   // Countdown state before each set
   const [countdownText, setCountdownText] = useState('3');
@@ -51,17 +53,18 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
   const [completedSetsCount, setCompletedSetsCount] = useState(0);
   const [completedRepsCount, setCompletedRepsCount] = useState(0);
 
-  // Camera / Video refs
+  // Camera / Video / Socket refs
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const socketRef = useRef<Socket | null>(null);
+  const frameIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const engineRef = useRef<BaseEngine>(new SquatEngine());
-  const animFrameRef = useRef<number | null>(null);
-  const poseModelRef = useRef<any>(null);
   const lastErrorRef = useRef(false);
   const lastRepsRef = useRef(0);
 
-  // Switch engine when exercise changes
+  // Switch engine on exercise change
   useEffect(() => {
     if (!currentEx) return;
 
@@ -82,9 +85,75 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
     setErrorFlag(st.errorFlag);
     lastErrorRef.current = st.errorFlag;
     setAngles(st.angles || {});
-  }, [currentExerciseIndex]);
+    setCameraError(null);
+  }, [currentExerciseIndex, currentEx]);
 
-  // Handle countdown before starting each set
+  // Connect socket for Python MediaPipe backend
+  useEffect(() => {
+    const socket = io({
+      transports: ['websocket', 'polling'],
+      reconnectionAttempts: 5,
+      timeout: 3000
+    });
+
+    socket.on('connect', () => {
+      if (currentEx?.hasAiCamera) {
+        socket.emit('select_exercise', { exercise: currentEx.key });
+      }
+    });
+
+    socket.on('pose_feedback', (data: any) => {
+      if (!data) return;
+
+      if (typeof data.reps === 'number') {
+        if (data.reps > lastRepsRef.current) {
+          Sound.playSuccess();
+          setBumpReps(true);
+          setTimeout(() => setBumpReps(false), 250);
+        }
+        lastRepsRef.current = data.reps;
+        setCurrentReps(data.reps);
+      }
+
+      if (data.error_flag && !lastErrorRef.current) {
+        Sound.playError();
+      }
+      lastErrorRef.current = !!data.error_flag;
+
+      if (data.status_text) setStatusText(data.status_text);
+      if (data.status_color) setStatusColor(data.status_color);
+      setErrorFlag(!!data.error_flag);
+      if (data.angles) setAngles(data.angles);
+
+      // Draw skeleton received from Python MediaPipe
+      if (canvasRef.current) {
+        const ctx = canvasRef.current.getContext('2d');
+        if (ctx) {
+          if (data.landmarks && data.landmarks.length > 0) {
+            drawSkeletonOnCanvas(ctx, canvasRef.current.width, canvasRef.current.height, data.landmarks, !!data.error_flag);
+          } else {
+            ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+          }
+        }
+      }
+    });
+
+    socketRef.current = socket;
+
+    return () => {
+      socket.disconnect();
+      socketRef.current = null;
+    };
+  }, []);
+
+  // Sync selected exercise with socket
+  useEffect(() => {
+    if (socketRef.current && socketRef.current.connected && currentEx?.hasAiCamera) {
+      socketRef.current.emit('select_exercise', { exercise: currentEx.key });
+    }
+  }, [currentEx]);
+
+  // Countdown before starting set
   const runPreSetCountdown = useCallback(async () => {
     setPhase('countdown');
     const steps = [
@@ -109,65 +178,103 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
     setPhase('exercise');
   }, []);
 
-  // Initialize camera if AI exercise
+  // Initialize REAL webcam (absolutely NO video fallbacks!)
   const startCameraFeed = useCallback(async () => {
     if (!currentEx?.hasAiCamera) return;
+    setCameraError(null);
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
         audio: false
       });
+
       streamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
+
         if (canvasRef.current) {
           canvasRef.current.width = videoRef.current.videoWidth || 640;
           canvasRef.current.height = videoRef.current.videoHeight || 480;
         }
-      }
-    } catch {
-      // Fallback demo video
-      if (videoRef.current) {
-        videoRef.current.srcObject = null;
-        videoRef.current.src = currentEx.key === 'shoulders' ? '/videos/shoulders.mp4' : '/videos/squat.mp4';
-        videoRef.current.loop = true;
-        try {
-          await videoRef.current.play();
-        } catch {}
-        if (canvasRef.current) {
-          canvasRef.current.width = 640;
-          canvasRef.current.height = 480;
+
+        // Hidden canvas for frame capture
+        if (!captureCanvasRef.current) {
+          captureCanvasRef.current = document.createElement('canvas');
+          captureCanvasRef.current.width = 480;
+          captureCanvasRef.current.height = 360;
         }
       }
-    }
-  }, [currentEx]);
 
-  // Clean up camera stream
-  const stopCameraFeed = useCallback(() => {
-    if (animFrameRef.current) {
-      cancelAnimationFrame(animFrameRef.current);
-      animFrameRef.current = null;
+      await runPreSetCountdown();
+    } catch (err: any) {
+      console.warn('Webcam permission error:', err);
+      // Clean error without any video fallback
+      setCameraError('Веб-камера недоступна. Пожалуйста, подключите камеру и разрешите доступ к ней в настройках браузера.');
     }
+  }, [currentEx, runPreSetCountdown]);
+
+  // Clean up camera stream and frame sending
+  const stopCameraFeed = useCallback(() => {
+    if (frameIntervalRef.current) {
+      clearInterval(frameIntervalRef.current);
+      frameIntervalRef.current = null;
+    }
+
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(t => t.stop());
       streamRef.current = null;
     }
+
     if (videoRef.current) {
       videoRef.current.srcObject = null;
-      videoRef.current.pause();
+    }
+
+    if (canvasRef.current) {
+      const ctx = canvasRef.current.getContext('2d');
+      if (ctx) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
     }
   }, []);
+
+  // Frame capture loop sending webcam frames to Python MediaPipe socket
+  useEffect(() => {
+    if (phase !== 'exercise' || !currentEx?.hasAiCamera || cameraError) return;
+
+    frameIntervalRef.current = setInterval(() => {
+      if (!videoRef.current || videoRef.current.readyState < 2) return;
+
+      if (!captureCanvasRef.current) {
+        captureCanvasRef.current = document.createElement('canvas');
+        captureCanvasRef.current.width = 480;
+        captureCanvasRef.current.height = 360;
+      }
+
+      const captureCtx = captureCanvasRef.current.getContext('2d');
+      if (!captureCtx) return;
+
+      captureCtx.drawImage(videoRef.current, 0, 0, 480, 360);
+      const dataUrl = captureCanvasRef.current.toDataURL('image/jpeg', 0.6);
+
+      if (socketRef.current && socketRef.current.connected) {
+        socketRef.current.emit('process_frame', { frame: dataUrl });
+      }
+    }, 70); // 14 FPS
+
+    return () => {
+      if (frameIntervalRef.current) {
+        clearInterval(frameIntervalRef.current);
+        frameIntervalRef.current = null;
+      }
+    };
+  }, [phase, currentEx, cameraError]);
 
   // Start set sequence
   useEffect(() => {
     if (phase === 'finished') return;
 
     if (currentEx?.hasAiCamera) {
-      startCameraFeed().then(() => {
-        runPreSetCountdown();
-      });
+      startCameraFeed();
     } else {
       if (currentEx?.unit === 'сек.') {
         setExerciseTimer(0);
@@ -180,116 +287,6 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
       stopCameraFeed();
     };
   }, [currentExerciseIndex, currentSetIndex, currentEx, startCameraFeed, stopCameraFeed, runPreSetCountdown]);
-
-  // Loop for pose tracking when in exercise phase
-  useEffect(() => {
-    if (phase !== 'exercise' || !currentEx?.hasAiCamera) return;
-
-    let simAngle = 175;
-    let simDir = -1;
-    let lastTime = 0;
-
-    const loop = (time: number) => {
-      if (!videoRef.current) return;
-
-      if (time - lastTime > 65) {
-        lastTime = time;
-
-        if (currentEx.key === 'squat') {
-          simAngle += simDir * 4;
-          if (simAngle <= 75) simDir = 1;
-          if (simAngle >= 175) simDir = -1;
-
-          const rad = (simAngle * Math.PI) / 180;
-          const simulatedLandmarks: Landmark[] = Array(33).fill({ x: 0.5, y: 0.5, visibility: 0.9 });
-          simulatedLandmarks[23] = { x: 0.44, y: 0.45, visibility: 0.95 };
-          simulatedLandmarks[24] = { x: 0.48, y: 0.45, visibility: 0.95 };
-          simulatedLandmarks[25] = { x: 0.5, y: 0.65, visibility: 0.95 };
-          simulatedLandmarks[26] = { x: 0.52, y: 0.65, visibility: 0.95 };
-          simulatedLandmarks[27] = { x: 0.5, y: 0.88, visibility: 0.95 };
-          simulatedLandmarks[28] = { x: 0.52, y: 0.88, visibility: 0.95 };
-          simulatedLandmarks[11] = { x: 0.44, y: 0.22, visibility: 0.95 };
-          simulatedLandmarks[12] = { x: 0.48, y: 0.22, visibility: 0.95 };
-
-          const state = engineRef.current.process(simulatedLandmarks);
-          handlePoseFeedback(state, simulatedLandmarks);
-        } else if (currentEx.key === 'shoulders') {
-          simAngle += simDir * 3.5;
-          if (simAngle <= 80) simDir = 1;
-          if (simAngle >= 170) simDir = -1;
-
-          const rad = (simAngle * Math.PI) / 180;
-          const simulatedLandmarks: Landmark[] = Array(33).fill({ x: 0.5, y: 0.5, visibility: 0.9 });
-          const wristY = 0.4 + Math.cos(rad) * 0.3;
-          simulatedLandmarks[11] = { x: 0.42, y: 0.4, visibility: 0.95 };
-          simulatedLandmarks[12] = { x: 0.58, y: 0.4, visibility: 0.95 };
-          simulatedLandmarks[13] = { x: 0.3, y: 0.4, visibility: 0.95 };
-          simulatedLandmarks[14] = { x: 0.7, y: 0.4, visibility: 0.95 };
-          simulatedLandmarks[15] = { x: 0.2, y: wristY, visibility: 0.95 };
-          simulatedLandmarks[16] = { x: 0.8, y: wristY, visibility: 0.95 };
-          simulatedLandmarks[23] = { x: 0.44, y: 0.68, visibility: 0.95 };
-          simulatedLandmarks[24] = { x: 0.56, y: 0.68, visibility: 0.95 };
-
-          const state = engineRef.current.process(simulatedLandmarks);
-          handlePoseFeedback(state, simulatedLandmarks);
-        } else {
-          // Biceps
-          simAngle += simDir * 4.2;
-          if (simAngle <= 38) simDir = 1;
-          if (simAngle >= 165) simDir = -1;
-
-          const rad = (simAngle * Math.PI) / 180;
-          const simulatedLandmarks: Landmark[] = Array(33).fill({ x: 0.5, y: 0.5, visibility: 0.9 });
-          simulatedLandmarks[11] = { x: 0.48, y: 0.3, visibility: 0.95 };
-          simulatedLandmarks[12] = { x: 0.52, y: 0.3, visibility: 0.95 };
-          simulatedLandmarks[14] = { x: 0.52, y: 0.5, visibility: 0.95 };
-          simulatedLandmarks[16] = { x: 0.52 - Math.sin(rad) * 0.22, y: 0.5 - Math.cos(rad) * 0.22, visibility: 0.95 };
-          simulatedLandmarks[24] = { x: 0.52, y: 0.7, visibility: 0.95 };
-
-          const state = engineRef.current.process(simulatedLandmarks);
-          handlePoseFeedback(state, simulatedLandmarks);
-        }
-      }
-
-      animFrameRef.current = requestAnimationFrame(loop);
-    };
-
-    animFrameRef.current = requestAnimationFrame(loop);
-    return () => {
-      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
-    };
-  }, [phase, currentEx]);
-
-  const handlePoseFeedback = (state: ReturnType<BaseEngine['process']>, landmarks?: Landmark[]) => {
-    if (state.reps > lastRepsRef.current) {
-      Sound.playSuccess();
-      setBumpReps(true);
-      setTimeout(() => setBumpReps(false), 250);
-    }
-    lastRepsRef.current = state.reps;
-    setCurrentReps(state.reps);
-
-    if (state.errorFlag && !lastErrorRef.current) {
-      Sound.playError();
-    }
-    lastErrorRef.current = state.errorFlag;
-
-    setStatusText(state.statusText);
-    setStatusColor(state.statusColor);
-    setErrorFlag(state.errorFlag);
-    if (state.angles) setAngles(state.angles);
-
-    if (canvasRef.current) {
-      const ctx = canvasRef.current.getContext('2d');
-      if (ctx) {
-        if (landmarks && landmarks.length > 0) {
-          drawSkeletonOnCanvas(ctx, canvasRef.current.width, canvasRef.current.height, landmarks, state.errorFlag);
-        } else {
-          ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
-        }
-      }
-    }
-  };
 
   // Timer for manual timed exercises (like Plank)
   useEffect(() => {
@@ -335,7 +332,6 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
     const isLastExercise = currentExerciseIndex >= exercises.length - 1;
 
     if (isLastSetOfCurrentEx && isLastExercise) {
-      // Completed full session!
       const totalSetsFinished = completedSetsCount + 1;
       const totalRepsFinished = completedRepsCount + finalReps;
       const duration = Math.max(1, Math.round((Date.now() - startTimeRef.current) / 1000));
@@ -366,7 +362,7 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
       return;
     }
 
-    // Otherwise, transition to Rest phase
+    // Transition to Rest phase
     setPhase('rest');
     setRestSecondsLeft(restDurationSeconds);
   };
@@ -418,7 +414,6 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
     advanceToNextSet();
   };
 
-  // Next exercise preview string
   const getNextUpPreview = () => {
     if (currentSetIndex < currentEx.setsCount) {
       return `${currentEx.name} · Подход ${currentSetIndex + 1} из ${currentEx.setsCount}`;
@@ -561,63 +556,84 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
         {currentEx.hasAiCamera ? (
           /* РЕЖИМ С AI-КАМЕРОЙ */
           <div className="trainer-wrapper">
-            <div className="trainer-stage">
-              <video
-                ref={videoRef}
-                className="trainer-video-feed"
-                playsInline
-                autoPlay
-                muted
-              />
-              <canvas ref={canvasRef} className="trainer-canvas-overlay" />
-
-              {/* Обратный отсчет до старта */}
-              {phase === 'countdown' && (
-                <div className="countdown-overlay">
-                  <div className="countdown-label">Приготовьтесь к подходу</div>
-                  <div className={`countdown-number ${countdownIsGo ? 'go' : ''}`}>
-                    {countdownText}
-                  </div>
+            {cameraError ? (
+              /* Сообщение об ошибке камеры без видеофайлов */
+              <div className="manual-workout-card" style={{ border: '1.5px solid #fecaca', background: '#fff' }}>
+                <span style={{ fontSize: '56px', display: 'block', marginBottom: '14px' }}>📹</span>
+                <h3 style={{ fontSize: '22px', fontWeight: 800, color: '#dc2626', marginBottom: '8px' }}>
+                  Веб-камера недоступна
+                </h3>
+                <p style={{ color: '#737373', fontSize: '14px', maxWidth: '480px', margin: '0 auto 24px', lineHeight: 1.5 }}>
+                  {cameraError}
+                </p>
+                <div style={{ display: 'flex', gap: '12px', justifyContent: 'center', flexWrap: 'wrap' }}>
+                  <button className="btn btn-accent" onClick={startCameraFeed}>
+                    🔄 Повторить запрос к веб-камере
+                  </button>
+                  <button className="btn btn-outline" onClick={handleCompleteSet}>
+                    ✓ Выполнить подход вручную
+                  </button>
                 </div>
-              )}
+              </div>
+            ) : (
+              <div className="trainer-stage">
+                <video
+                  ref={videoRef}
+                  className="trainer-video-feed"
+                  playsInline
+                  autoPlay
+                  muted
+                />
+                <canvas ref={canvasRef} className="trainer-canvas-overlay" />
 
-              {/* HUD оверлей */}
-              <div className="trainer-hud">
-                <div className="hud-top">
-                  <div className="hud-pill">
-                    <span className="live-indicator" />
-                    AI VISION · ПОДХОД {currentSetIndex}/{currentEx.setsCount}
-                  </div>
-                  <div className="rep-display-box">
-                    <div className={`rep-number ${bumpReps ? 'bump' : ''}`}>{currentReps}</div>
-                    <div className="rep-label">из {currentEx.targetReps} {currentEx.unit}</div>
-                  </div>
-                </div>
-
-                <div className="hud-bottom">
-                  <div className={`trainer-status-banner ${errorFlag ? 'error' : statusColor === '#00aa55' ? 'success' : ''}`}>
-                    <div className="status-left">
-                      <span className="status-indicator-dot" style={{ backgroundColor: statusColor }} />
-                      <span className="status-text">{statusText}</span>
+                {/* Обратный отсчет до старта */}
+                {phase === 'countdown' && (
+                  <div className="countdown-overlay">
+                    <div className="countdown-label">Приготовьтесь к подходу</div>
+                    <div className={`countdown-number ${countdownIsGo ? 'go' : ''}`}>
+                      {countdownText}
                     </div>
+                  </div>
+                )}
 
-                    {angles && Object.keys(angles).length > 0 && (
-                      <div className="angle-badge">
-                        {Object.entries(angles)
-                          .map(([k, v]) => `${k === 'knee' ? 'Колено' : k === 'elbow' ? 'Локоть' : k}: ${v}°`)
-                          .join(' | ')}
+                {/* HUD оверлей */}
+                <div className="trainer-hud">
+                  <div className="hud-top">
+                    <div className="hud-pill">
+                      <span className="live-indicator" />
+                      PYTHON MEDIAPIPE CORE · ПОДХОД {currentSetIndex}/{currentEx.setsCount}
+                    </div>
+                    <div className="rep-display-box">
+                      <div className={`rep-number ${bumpReps ? 'bump' : ''}`}>{currentReps}</div>
+                      <div className="rep-label">из {currentEx.targetReps} {currentEx.unit}</div>
+                    </div>
+                  </div>
+
+                  <div className="hud-bottom">
+                    <div className={`trainer-status-banner ${errorFlag ? 'error' : statusColor === '#00aa55' ? 'success' : ''}`}>
+                      <div className="status-left">
+                        <span className="status-indicator-dot" style={{ backgroundColor: statusColor }} />
+                        <span className="status-text">{statusText}</span>
                       </div>
-                    )}
+
+                      {angles && Object.keys(angles).length > 0 && (
+                        <div className="angle-badge">
+                          {Object.entries(angles)
+                            .map(([k, v]) => `${k === 'knee' ? 'Колено' : k === 'elbow' ? 'Локоть' : k}: ${v}°`)
+                            .join(' | ')}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
-            </div>
+            )}
 
             {/* Панель управления сетом */}
             <div className="trainer-controls-panel">
               <div className="controls-left">
                 <span style={{ fontSize: '13px', color: '#666' }}>
-                  Нейросеть фиксирует каждое чистое повторение
+                  Python MediaPipe Pose анализирует технику в реальном времени
                 </span>
               </div>
               <div className="controls-right">
@@ -644,7 +660,6 @@ export const WorkoutRunner: React.FC<Props> = ({ sessionConfig, onExit, onSaveSe
               </p>
             </div>
 
-            {/* Таймер или счетчик повторов */}
             <div className="manual-target-display">
               {currentEx.unit === 'сек.' ? (
                 <div>

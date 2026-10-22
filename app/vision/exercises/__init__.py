@@ -1,0 +1,1 @@
+# SmartFit Exercises Package
